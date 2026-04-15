@@ -1,0 +1,40 @@
+version: "3.8"
+
+services:
+  mdserver-web:
+    build:
+      context: ../../          # 以仓库根目录为构建上下文
+      dockerfile: docker/vuln/Dockerfile
+    image: mdserver-web-vuln:0.18.5
+    container_name: mdserver-web-vuln
+    restart: "no"              # 漏洞环境不自动重启
+    ports:
+      - "7200:7200"
+    volumes:
+      - mdserver_data:/www/server/mdserver-web/data
+      - mdserver_logs:/www/server/mdserver-web/logs
+      - mdserver_cron:/www/server/cron
+    environment:
+      - LANG=en_US.UTF-8
+      - LC_ALL=en_US.UTF-8
+    networks:
+      - vuln_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7200/check_login"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+networks:
+  vuln_net:
+    driver: bridge
+    name: mdserver_vuln_net
+
+volumes:
+  mdserver_data:
+    name: mdserver_vuln_data
+  mdserver_logs:
+    name: mdserver_vuln_logs
+  mdserver_cron:
+    name: mdserver_vuln_cron
