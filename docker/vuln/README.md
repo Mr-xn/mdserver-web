@@ -614,6 +614,7 @@ docker/vuln/
 ├── start.sh            # 一键启动
 ├── stop.sh             # 停止（保留数据）
 ├── clean.sh            # 完全清理（容器+镜像+网络+卷）
+├── poc_test.py         # Python 自动化漏洞测试脚本
 └── README.md           # 本文档
 ```
 
@@ -1112,6 +1113,47 @@ curl -s -X POST http://127.0.0.1:7200/crontab/list \
   -d "p=1&limit=10"
 # 预期: 仍然返回任务列表，证明 IP 白名单无效
 ```
+
+---
+
+### 自动化漏洞测试脚本（Python）
+
+除上述手动 PoC 外，本环境还提供了一个综合 Python 测试脚本 `poc_test.py`，覆盖全部 9 个未授权路由漏洞、API Key 认证绕过漏洞以及完整 RCE 利用链：
+
+```bash
+# 安装依赖
+pip install requests
+
+# 全量测试（自动预置任务和 API 凭据）
+python3 docker/vuln/poc_test.py --setup-task --setup-api
+
+# 仅测试信息泄露，跳过破坏性和 RCE 测试
+python3 docker/vuln/poc_test.py --skip-destructive --skip-rce
+
+# 自定义目标
+python3 docker/vuln/poc_test.py --target http://192.168.1.100:7200 \
+    --api-id my_app --api-secret my_secret
+```
+
+脚本覆盖的测试项：
+
+| 编号 | 测试内容 | 严重性 |
+|------|---------|--------|
+| VULN-01 | `/crontab/get_data_list` 未授权 | HIGH |
+| VULN-02 | `/crontab/get_crond_find` 未授权 + ID 枚举 | HIGH |
+| VULN-03 | `/crontab/logs` 未授权 | MEDIUM |
+| VULN-04 | `/crontab/modify_crond` 未授权 | CRITICAL |
+| VULN-05 | `/crontab/start_task` 未授权 | CRITICAL |
+| VULN-06 | `/crontab/del_logs` 未授权 | MEDIUM |
+| VULN-07 | `/crontab/set_cron_status` 未授权 | HIGH |
+| VULN-08 | `/crontab/del` 未授权 | HIGH |
+| VULN-09 | `/site/get_site_doc` 未授权 | MEDIUM |
+| RCE-01 | 无认证 RCE 利用链（枚举→注入→触发） | CRITICAL |
+| API-01 | API Key 绕过 Session 认证 | HIGH |
+| API-02 | IP 白名单形同虚设 | HIGH |
+| API-03 | panel_api 危险默认值 `open:True` | MEDIUM |
+| API-04 | 无效 App-Id 触发 TypeError | LOW |
+| API-RCE | API Key + Shell 注入 → RCE | CRITICAL |
 
 ---
 
