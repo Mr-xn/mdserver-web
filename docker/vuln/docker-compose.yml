@@ -3,7 +3,7 @@ services:
     build:
       context: ../../          # 以仓库根目录为构建上下文
       dockerfile: docker/vuln/Dockerfile
-    image: mdserver-web-vuln:0.18.5
+    image: mdserver-web-vuln:0.18.4
     container_name: mdserver-web-vuln
     restart: "no"              # 漏洞环境不自动重启
     ports:

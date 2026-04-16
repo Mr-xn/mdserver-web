@@ -1,4 +1,4 @@
-# mdserver-web ≤0.18.5 多处未授权访问 + 信息泄露 + RCE 漏洞分析
+# mdserver-web ≤0.18.4 多处未授权访问 + 信息泄露 + RCE 漏洞分析
 
 ---
 
@@ -931,7 +931,7 @@ root
 
 ```bash
 #!/bin/bash
-# PoC: mdserver-web ≤0.18.5 无认证 RCE
+# PoC: mdserver-web ≤0.18.4 无认证 RCE
 # 用法: bash poc.sh <target> <command>
 # 示例: bash poc.sh http://127.0.0.1:7200 'id>/tmp/pwned.txt'
 
@@ -1276,7 +1276,7 @@ if stype == 'toUrl':
 |--------|---------|------|
 | ≤ `33cabc8e2` | ⚠️ 完全受影响 | 计划任务 8 个路由 + `/get_site_doc` 均无认证 |
 | `c508c71f6` + `8586dbbe8` | ✅ 路由认证已修复 | PR #884，但认证中间件漏洞仍在 |
-| `afdccefa9`（0.18.5） | ⚠️ 部分受影响 | 路由认证已修复，API Key 认证绕过仍在 |
+| `afdccefa9`（0.18.5） | ✅ 路由认证已修复 | 计划任务所有路由均已加 `@panel_login_required`，API Key 认证绕过仍在 |
 
 ### 临时缓解措施（治标）
 

@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 COMPOSE_FILE="${SCRIPT_DIR}/docker-compose.yml"
 
 echo "================================================================"
-echo "  mdserver-web <=0.18.5 漏洞复现环境 - 启动"
+echo "  mdserver-web <=0.18.4 漏洞复现环境 - 启动"
 echo "================================================================"
 
 # 切换到仓库根目录（构建上下文）
@@ -45,6 +45,21 @@ echo "================================================================"
 echo "  面板地址  : http://127.0.0.1:7200/${SAFE_PATH}"
 echo "  用户名    : ${USER}"
 echo "  密码      : ${PASS}"
+echo ""
+
+# 验证容器运行的是漏洞版本（0.18.4）
+VERSION=$(docker exec mdserver-web-vuln python3 -c \
+  "import sys; sys.path.insert(0,'/www/server/mdserver-web/web'); from version import APP_VERSION; print(APP_VERSION)" \
+  2>/dev/null || echo "unknown")
+PROTECTED_COUNT=$(docker exec mdserver-web-vuln grep -c "@panel_login_required" \
+  /www/server/mdserver-web/web/admin/crontab/__init__.py 2>/dev/null || echo "?")
+echo "  📋 版本验证: ${VERSION}"
+if [ "${VERSION}" = "0.18.4" ]; then
+  echo "  ✅ 漏洞版本确认：运行的是 0.18.4（存在漏洞）"
+else
+  echo "  ⚠️  版本异常：期望 0.18.4，实际 ${VERSION}，漏洞复现可能失败"
+fi
+echo "  📋 crontab 路由 @panel_login_required 数量: ${PROTECTED_COUNT}（漏洞版本应为 4，修复版本为 12）"
 echo ""
 echo "  ℹ️  如安全路径为空，直接访问 http://127.0.0.1:7200/login"
 echo "  ℹ️  容器名  : mdserver-web-vuln"
