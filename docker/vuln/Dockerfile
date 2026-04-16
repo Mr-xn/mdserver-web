@@ -6,7 +6,7 @@ LABEL description="mdserver-web 0.18.4 认证绕过+RCE 漏洞复现环境"
 # 安装系统依赖（不编译 PHP/MySQL/OpenResty）
 RUN apt-get update -y && \
     apt-get install -y --no-install-recommends \
-        curl wget git \
+        curl wget \
         locales \
         cron \
         procps \
@@ -26,14 +26,18 @@ RUN mkdir -p /www/server/mdserver-web/data && \
     mkdir -p /www/wwwroot && \
     mkdir -p /www/backup
 
-# 将当前代码复制进镜像（含 .git，用于下一步 checkout 漏洞版本）
+# 将当前代码（最新版）复制进镜像
 COPY . /www/server/mdserver-web/
 
-# 切回最后一个存在漏洞的版本（0.18.4）的 web 目录代码。
-# 0.18.5 已对 crontab/logs/modify_crond/start_task 等路由补加了 @panel_login_required，
-# 必须使用 0.18.4 才能复现认证绕过+RCE 漏洞。
-RUN git -C /www/server/mdserver-web checkout 0.18.4 -- web/ && \
-    rm -rf /www/server/mdserver-web/.git
+# 用 tag 0.18.4 的漏洞版本覆盖已修复的两个文件（共 9 个路由），
+# 使容器同时具备：
+#   - 旧版未授权路由漏洞（crontab 8 个 + get_site_doc 1 个）
+#   - 全版本 API Key 认证绕过漏洞（user_login_check.py 未改动，最新版仍存在）
+# 无需在镜像内使用 git，避免构建上下文不含 .git 时的 fatal 错误。
+COPY docker/vuln/vuln_web/admin/crontab/__init__.py \
+     /www/server/mdserver-web/web/admin/crontab/__init__.py
+COPY docker/vuln/vuln_web/admin/site/site_default.py \
+     /www/server/mdserver-web/web/admin/site/site_default.py
 
 # 安装 Python 依赖（过滤掉版本无效的 zmq==0.0.0）
 RUN pip install --no-cache-dir --upgrade pip && \
