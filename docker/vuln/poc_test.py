@@ -124,17 +124,28 @@ def docker_exec(cmd: str) -> Optional[str]:
 
 def docker_python(script: str) -> Optional[str]:
     """在 Docker 容器内执行 Python 代码
-    
+
+    通过 stdin 传入脚本，避免将代码嵌入 shell 命令字符串（防止脚本内含
+    双引号时破坏 bash -c "python3 -c \"...\"" 的引号嵌套）。
+
     注意：script 参数仅接受本文件中硬编码的 Python 代码片段，
     不接受任何外部用户输入，因此不存在注入风险。
     """
-    cmd = f"""python3 -c "
-import sys, os
-os.chdir('/www/server/mdserver-web/web')
-sys.path.insert(0, '/www/server/mdserver-web/web')
-{script}
-" """
-    return docker_exec(cmd)
+    full_script = (
+        "import sys, os\n"
+        "os.chdir('/www/server/mdserver-web/web')\n"
+        "sys.path.insert(0, '/www/server/mdserver-web/web')\n"
+        + script
+    )
+    try:
+        result = subprocess.run(
+            ["docker", "exec", "-i", CONTAINER_NAME, "python3"],
+            input=full_script,
+            capture_output=True, text=True, timeout=30
+        )
+        return result.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
+        return None
 
 
 def is_json_response(resp: requests.Response) -> bool:
@@ -1102,7 +1113,9 @@ def test_api_rce_chain(ctx: TestContext) -> TestResult:
     if resp and is_json_response(resp):
         try:
             data = resp.json()
-            tasks = data.get("data", {}).get("data", [])
+            # /crontab/list 返回 {"data": [...tasks...]}，data["data"] 直接是列表
+            tasks_raw = data.get("data", [])
+            tasks = tasks_raw if isinstance(tasks_raw, list) else tasks_raw.get("data", [])
             for t in tasks:
                 if t.get("name") == "api_rce_test_task":
                     task_id = t["id"]

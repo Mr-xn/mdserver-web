@@ -1,7 +1,7 @@
 FROM python:3.11-slim
 
 LABEL maintainer="vuln-research"
-LABEL description="mdserver-web <=0.18.4 认证绕过+RCE 漏洞复现环境（0.18.5 已修复）"
+LABEL description="mdserver-web 0.18.4 认证绕过+RCE 漏洞复现环境"
 
 # 安装系统依赖（不编译 PHP/MySQL/OpenResty）
 RUN apt-get update -y && \

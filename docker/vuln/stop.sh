@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 COMPOSE_FILE="${SCRIPT_DIR}/docker-compose.yml"
 
 echo "================================================================"
-echo "  mdserver-web <=0.18.5 漏洞复现环境 - 停止"
+echo "  mdserver-web 0.18.4 漏洞复现环境 - 停止"
 echo "================================================================"
 echo "[*] 停止容器（数据卷保留，下次 start.sh 可直接恢复）..."
 docker compose -f "${COMPOSE_FILE}" stop

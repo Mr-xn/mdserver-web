@@ -7,13 +7,13 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 COMPOSE_FILE="${SCRIPT_DIR}/docker-compose.yml"
 
-IMAGE_NAME="mdserver-web-vuln:0.18.5"
+IMAGE_NAME="mdserver-web-vuln:0.18.4"
 CONTAINER_NAME="mdserver-web-vuln"
 NETWORK_NAME="mdserver_vuln_net"
 VOLUMES="mdserver_vuln_data mdserver_vuln_logs mdserver_vuln_cron"
 
 echo "================================================================"
-echo "  mdserver-web <=0.18.5 漏洞复现环境 - 完全清理"
+echo "  mdserver-web 0.18.4 漏洞复现环境 - 完全清理"
 echo "================================================================"
 echo "⚠️  此操作将删除容器、镜像、网络及所有挂载卷，数据不可恢复！"
 read -r -p "确认继续? [y/N] " confirm
