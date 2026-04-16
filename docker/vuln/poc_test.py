@@ -542,16 +542,8 @@ def test_unauth_start_task(ctx: TestContext) -> TestResult:
             severity="CRITICAL"
         )
 
-    # 必须是 JSON 业务响应才能确认进入了函数；HTML 说明被拦截
-    if not is_json_response(resp):
-        return TestResult(
-            name="/crontab/start_task 未授权 - 触发任务执行",
-            vuln_id="VULN-05",
-            success=False,
-            detail=f"响应为非 JSON（HTTP {resp.status_code}），接口被拦截，漏洞已修复",
-            severity="CRITICAL"
-        )
-
+    # 任何非认证拦截响应（包括 HTTP 500 因不存在的 ID 触发 TypeError）
+    # 均说明函数体已被执行，即端点无需认证即可访问
     return TestResult(
         name="/crontab/start_task 未授权 - 触发任务执行",
         vuln_id="VULN-05",
@@ -630,15 +622,8 @@ def test_unauth_set_cron_status(ctx: TestContext) -> TestResult:
             severity="HIGH"
         )
 
-    if not is_json_response(resp):
-        return TestResult(
-            name="/crontab/set_cron_status 未授权 - 切换任务状态",
-            vuln_id="VULN-07",
-            success=False,
-            detail=f"响应为非 JSON（HTTP {resp.status_code}），接口被拦截，漏洞已修复",
-            severity="HIGH"
-        )
-
+    # 任何非认证拦截响应（包括 HTTP 500 因不存在的 ID 触发 TypeError）
+    # 均说明函数体已被执行，即端点无需认证即可访问
     return TestResult(
         name="/crontab/set_cron_status 未授权 - 切换任务状态",
         vuln_id="VULN-07",
@@ -674,15 +659,8 @@ def test_unauth_del(ctx: TestContext) -> TestResult:
             severity="HIGH"
         )
 
-    if not is_json_response(resp):
-        return TestResult(
-            name="/crontab/del 未授权 - 删除计划任务",
-            vuln_id="VULN-08",
-            success=False,
-            detail=f"响应为非 JSON（HTTP {resp.status_code}），接口被拦截，漏洞已修复",
-            severity="HIGH"
-        )
-
+    # 任何非认证拦截响应（包括 HTTP 500 因不存在的 ID 触发 TypeError）
+    # 均说明函数体已被执行，即端点无需认证即可访问
     return TestResult(
         name="/crontab/del 未授权 - 删除计划任务",
         vuln_id="VULN-08",
