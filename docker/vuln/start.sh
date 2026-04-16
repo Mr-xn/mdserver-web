@@ -53,10 +53,10 @@ echo ""
 PROTECTED_COUNT=$(docker exec mdserver-web-vuln grep -c "@panel_login_required" \
   /www/server/mdserver-web/web/admin/crontab/__init__.py 2>/dev/null || echo "?")
 echo "  📋 crontab 路由 @panel_login_required 数量: ${PROTECTED_COUNT}"
-if [ "${PROTECTED_COUNT}" = "4" ]; then
-  echo "  ✅ 漏洞代码确认：crontab 仅 4 处有认证（8 个路由无保护：logs/del/del_logs/set_cron_status/get_data_list/get_crond_find/modify_crond/start_task）"
-elif [ "${PROTECTED_COUNT}" = "12" ]; then
-  echo "  ⚠️  检测到修复版本代码（12 处认证），未授权路由漏洞复现将失败，请重新构建镜像"
+if [ "${PROTECTED_COUNT}" = "3" ]; then
+  echo "  ✅ 漏洞代码确认：crontab 仅 3 处有认证（8 个路由无保护：logs/del/del_logs/set_cron_status/get_data_list/get_crond_find/modify_crond/start_task）"
+elif [ "${PROTECTED_COUNT}" = "11" ]; then
+  echo "  ⚠️  检测到修复版本代码（11 处认证），未授权路由漏洞复现将失败，请重新构建镜像"
 else
   echo "  ⚠️  认证装饰器数量异常（${PROTECTED_COUNT}），请检查镜像内容"
 fi

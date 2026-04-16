@@ -674,8 +674,8 @@ docker exec mdserver-web-vuln cat /www/server/mdserver-web/data/default.pl
 # 检查 crontab 路由的认证装饰器数量
 docker exec mdserver-web-vuln grep -c "panel_login_required" \
   /www/server/mdserver-web/web/admin/crontab/__init__.py
-# 漏洞代码输出: 4（index/list/add/status_check 有认证，其余 8 个无）
-# 修复代码输出: 12（全部路由有认证）
+# 漏洞代码输出: 3（index/list/add 有认证，其余 8 个无）
+# 修复代码输出: 11（全部路由有认证）
 ```
 
 ---
