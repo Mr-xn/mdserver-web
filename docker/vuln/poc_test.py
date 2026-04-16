@@ -147,14 +147,25 @@ def is_json_response(resp: requests.Response) -> bool:
 
 
 def is_authenticated_redirect(resp: requests.Response) -> bool:
-    """检查是否被重定向到登录页（即需要认证）"""
+    """检查响应是否表示被认证机制拒绝（需要登录才能访问）
+
+    面板在未授权时有以下几种响应形式：
+    1. HTTP 401/403/302 — 配置了 unauthorized_status 为对应状态码时
+    2. HTTP 200 + path.html — unauthorized_status == '0'（默认值）时，
+       返回「安全入口校验失败」页面，内容含固定中文字符串
+    3. HTTP 200 + 英文 login 页面 — 其他面板软件兼容场景
+    """
     if resp is None:
         return True
-    if resp.status_code in (401, 403, 302):
+    if resp.status_code in (400, 401, 403, 302):
         return True
     if resp.status_code == 200:
-        text = resp.text.lower()
-        if "login" in text and "<!doctype" in text:
+        text = resp.text
+        # 面板安全入口拦截页（panel_login_required 在 unauthorized_status='0' 时返回）
+        if "安全入口校验失败" in text or "请使用正确的入口登录面板" in text:
+            return True
+        # 通用英文登录页检测
+        if "login" in text.lower() and "<!doctype" in text.lower():
             return True
     return False
 
@@ -312,10 +323,20 @@ def test_unauth_get_data_list(ctx: TestContext) -> TestResult:
             severity="HIGH"
         )
 
+    # 必须是 JSON 业务响应才算真正绕过了认证
+    if not is_json_response(resp):
+        return TestResult(
+            name="/crontab/get_data_list 未授权 - 获取网站列表",
+            vuln_id="VULN-01",
+            success=False,
+            detail=f"响应为非 JSON（HTTP {resp.status_code}），接口被拦截，漏洞已修复",
+            severity="HIGH"
+        )
+
     # 尝试同时获取数据库列表
     resp_db = post(url, data={"type": "database"})
     db_info = ""
-    if resp_db and not is_authenticated_redirect(resp_db):
+    if resp_db and not is_authenticated_redirect(resp_db) and is_json_response(resp_db):
         db_info = f"\n数据库列表响应: {resp_db.text[:200]}"
 
     return TestResult(
@@ -408,6 +429,16 @@ def test_unauth_logs(ctx: TestContext) -> TestResult:
             severity="MEDIUM"
         )
 
+    # 必须是 JSON 业务响应才算真正绕过了认证；HTML 响应说明被拦截
+    if not is_json_response(resp):
+        return TestResult(
+            name="/crontab/logs 未授权 - 读取任务日志",
+            vuln_id="VULN-03",
+            success=False,
+            detail=f"响应为非 JSON（HTTP {resp.status_code}），接口被拦截，漏洞已修复",
+            severity="MEDIUM"
+        )
+
     return TestResult(
         name="/crontab/logs 未授权 - 读取任务日志",
         vuln_id="VULN-03",
@@ -454,6 +485,16 @@ def test_unauth_modify_crond(ctx: TestContext) -> TestResult:
             severity="CRITICAL"
         )
 
+    # 必须是 JSON 业务响应才能确认进入了函数逻辑；HTML 响应说明仍被拦截
+    if not is_json_response(resp):
+        return TestResult(
+            name="/crontab/modify_crond 未授权 - 修改计划任务",
+            vuln_id="VULN-04",
+            success=False,
+            detail=f"响应为非 JSON（HTTP {resp.status_code}），接口被拦截，漏洞已修复",
+            severity="CRITICAL"
+        )
+
     # 能收到业务错误（如"任务名称不能为空"或500），说明无需认证即进入了函数
     return TestResult(
         name="/crontab/modify_crond 未授权 - 修改计划任务",
@@ -487,6 +528,16 @@ def test_unauth_start_task(ctx: TestContext) -> TestResult:
             vuln_id="VULN-05",
             success=False,
             detail=f"需要认证 (HTTP {resp.status_code})，漏洞已修复",
+            severity="CRITICAL"
+        )
+
+    # 必须是 JSON 业务响应才能确认进入了函数；HTML 说明被拦截
+    if not is_json_response(resp):
+        return TestResult(
+            name="/crontab/start_task 未授权 - 触发任务执行",
+            vuln_id="VULN-05",
+            success=False,
+            detail=f"响应为非 JSON（HTTP {resp.status_code}），接口被拦截，漏洞已修复",
             severity="CRITICAL"
         )
 
@@ -525,6 +576,15 @@ def test_unauth_del_logs(ctx: TestContext) -> TestResult:
             severity="MEDIUM"
         )
 
+    if not is_json_response(resp):
+        return TestResult(
+            name="/crontab/del_logs 未授权 - 删除任务日志",
+            vuln_id="VULN-06",
+            success=False,
+            detail=f"响应为非 JSON（HTTP {resp.status_code}），接口被拦截，漏洞已修复",
+            severity="MEDIUM"
+        )
+
     return TestResult(
         name="/crontab/del_logs 未授权 - 删除任务日志",
         vuln_id="VULN-06",
@@ -556,6 +616,15 @@ def test_unauth_set_cron_status(ctx: TestContext) -> TestResult:
             vuln_id="VULN-07",
             success=False,
             detail=f"需要认证 (HTTP {resp.status_code})，漏洞已修复",
+            severity="HIGH"
+        )
+
+    if not is_json_response(resp):
+        return TestResult(
+            name="/crontab/set_cron_status 未授权 - 切换任务状态",
+            vuln_id="VULN-07",
+            success=False,
+            detail=f"响应为非 JSON（HTTP {resp.status_code}），接口被拦截，漏洞已修复",
             severity="HIGH"
         )
 
@@ -591,6 +660,15 @@ def test_unauth_del(ctx: TestContext) -> TestResult:
             vuln_id="VULN-08",
             success=False,
             detail=f"需要认证 (HTTP {resp.status_code})，漏洞已修复",
+            severity="HIGH"
+        )
+
+    if not is_json_response(resp):
+        return TestResult(
+            name="/crontab/del 未授权 - 删除计划任务",
+            vuln_id="VULN-08",
+            success=False,
+            detail=f"响应为非 JSON（HTTP {resp.status_code}），接口被拦截，漏洞已修复",
             severity="HIGH"
         )
 
@@ -643,7 +721,7 @@ def test_unauth_get_site_doc(ctx: TestContext) -> TestResult:
         name="/site/get_site_doc 未授权 - 泄露服务器路径",
         vuln_id="VULN-09",
         success=False,
-        detail="未获取到路径信息或接口需要认证",
+        detail="接口需要认证（被安全拦截）或未获取到路径信息，漏洞已修复",
         severity="MEDIUM"
     )
 
