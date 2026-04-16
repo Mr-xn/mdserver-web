@@ -30,6 +30,7 @@ mdserver-web 漏洞自动化测试脚本
     python3 poc_test.py [--target URL] [--skip-destructive] [--skip-rce]
                         [--api-id ID] [--api-secret SECRET]
                         [--setup-api] [--setup-task]
+                        [--proxy PROXY_URL]
 
 示例:
     # 全量测试（需先启动漏洞环境）
@@ -40,6 +41,9 @@ mdserver-web 漏洞自动化测试脚本
 
     # 测试 API Key 认证绕过
     python3 poc_test.py --setup-api --api-id test_app --api-secret test_secret
+
+    # 通过 Burp Suite 代理抓包
+    python3 poc_test.py --proxy http://127.0.0.1:8080
 """
 
 import argparse
@@ -68,6 +72,9 @@ RCE_VERIFY_DELAY = 3  # 等待 RCE 命令执行完成的秒数
 RCE_MARKER_FILE = "/tmp/mdserver_poc_rce_test.txt"
 RCE_MARKER_CONTENT = "mdserver-web-poc-rce-verified"
 API_RCE_MARKER_FILE = "/tmp/mdserver_poc_api_rce_test.txt"
+
+# 全局 HTTP 会话（在 main() 中按需配置代理）
+_session = requests.Session()
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -102,9 +109,9 @@ class TestContext:
 # ──────────────────────────────────────────────────────────────────────
 
 def post(url: str, data: dict = None, headers: dict = None) -> Optional[requests.Response]:
-    """发送 POST 请求，统一异常处理"""
+    """发送 POST 请求，统一异常处理（使用全局会话，自动携带代理配置）"""
     try:
-        resp = requests.post(url, data=data, headers=headers, timeout=TIMEOUT)
+        resp = _session.post(url, data=data, headers=headers, timeout=TIMEOUT)
         return resp
     except requests.exceptions.RequestException as e:
         return None
@@ -1161,7 +1168,7 @@ def run_all_tests(ctx: TestContext):
     # 连通性检查
     print_section("连通性检查")
     try:
-        resp = requests.get(ctx.target, timeout=TIMEOUT, allow_redirects=False)
+        resp = _session.get(ctx.target, timeout=TIMEOUT, allow_redirects=False)
         print(f"  [+] 目标可达, HTTP {resp.status_code}")
     except requests.exceptions.RequestException as e:
         print(f"  [-] 目标不可达: {e}")
@@ -1269,6 +1276,9 @@ def main():
   # 自定义目标和 API 凭据
   python3 poc_test.py --target http://192.168.1.100:7200 \\
                       --api-id my_app --api-secret my_secret
+
+  # 通过 Burp Suite / mitmproxy 代理抓包
+  python3 poc_test.py --proxy http://127.0.0.1:8080
         """
     )
 
@@ -1300,8 +1310,16 @@ def main():
         "--setup-task", action="store_true",
         help="自动在容器中预置计划任务（需 Docker 访问权限）"
     )
+    parser.add_argument(
+        "--proxy", default="",
+        help="HTTP/HTTPS 代理地址，例如 http://127.0.0.1:8080"
+    )
 
     args = parser.parse_args()
+
+    if args.proxy:
+        _session.proxies.update({"http": args.proxy, "https": args.proxy})
+        print(f"[*] 使用代理: {args.proxy}")
 
     ctx = TestContext(
         target=args.target,
